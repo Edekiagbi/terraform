@@ -1,49 +1,49 @@
-locals {
-  name               = "marketsquare"
-  availability_zones = slice(data.aws_availability_zones.available.names, 0, 2)
-  public_subnet_cidrs = [
-    for index in range(2) : cidrsubnet("10.20.0.0/16", 8, index + 1)
-  ]
-}
 
-resource "aws_vpc" "main" {
-  cidr_block           = "10.20.0.0/16"
+resource "aws_vpc" "mymainvpc" {
+  cidr_block           = "10.0.0.0/16"
   enable_dns_hostnames = true
   enable_dns_support   = true
 }
 
-resource "aws_internet_gateway" "main" {
-  vpc_id = aws_vpc.main.id
+resource "aws_internet_gateway" "myigw" {
+  vpc_id = aws_vpc.mymainvpc.id
 }
 
-resource "aws_subnet" "public" {
-  count                   = 2
-  vpc_id                  = aws_vpc.main.id
-  availability_zone       = local.availability_zones[count.index]
-  cidr_block              = local.public_subnet_cidrs[count.index]
+resource "aws_subnet" "publicsubnet1" {
+
+  vpc_id                  = aws_vpc.mymainvpc.id
+  availability_zone       = data.aws_availability_zones.available.names[0]
+  cidr_block              = "10.0.0.0/24"
   map_public_ip_on_launch = true
 }
 
-resource "aws_route_table" "public" {
-  vpc_id = aws_vpc.main.id
+resource "aws_subnet" "publicsubnet2" {
+  vpc_id                  = aws_vpc.mymainvpc.id
+  availability_zone       = data.aws_availability_zones.available.names[1]
+  cidr_block              = "10.0.1.0/24"
+  map_public_ip_on_launch = true
 }
 
-resource "aws_route" "internet" {
-  route_table_id         = aws_route_table.public.id
+resource "aws_route_table" "publicRT" {
+  vpc_id = aws_vpc.mymainvpc.id
+}
+
+resource "aws_route" "publicRoute" {
+  route_table_id         = aws_route_table.publicRT.id
   destination_cidr_block = "0.0.0.0/0"
-  gateway_id             = aws_internet_gateway.main.id
+  gateway_id             = aws_internet_gateway.myigw.id
 }
 
-resource "aws_route_table_association" "public" {
+resource "aws_route_table_association" "subnetassoc" {
   count          = 2
-  subnet_id      = aws_subnet.public[count.index].id
-  route_table_id = aws_route_table.public.id
+  subnet_id      = [aws_subnet.publicsubnet1.id, aws_subnet.publicsubnet2.id][count.index]
+  route_table_id = aws_route_table.publicRT.id
 }
 
-resource "aws_security_group" "load_balancer" {
-  name        = "${local.name}-alb"
+resource "aws_security_group" "alsg" {
+  name        = "albsg"
   description = "Allow public HTTP traffic to the MarketSquare load balancer."
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = aws_vpc.mymainvpc.id
 
   ingress {
     description = "HTTP"
@@ -61,17 +61,17 @@ resource "aws_security_group" "load_balancer" {
   }
 }
 
-resource "aws_security_group" "tasks" {
-  name        = "${local.name}-tasks"
+resource "aws_security_group" "task-def" {
+  name        = "task-def-sg"
   description = "Allow HTTP only from the MarketSquare load balancer."
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = aws_vpc.mymainvpc.id
 
   ingress {
     description     = "Application traffic from the ALB"
     from_port       = 80
     to_port         = 80
     protocol        = "tcp"
-    security_groups = [aws_security_group.load_balancer.id]
+    security_groups = [aws_security_group.alsg.id]
   }
 
   egress {
@@ -82,20 +82,20 @@ resource "aws_security_group" "tasks" {
   }
 }
 
-resource "aws_lb" "main" {
-  name               = "marketsquare-alb"
+resource "aws_lb" "myalb" {
+  name_prefix        = "msq-"
   internal           = false
   load_balancer_type = "application"
-  security_groups    = [aws_security_group.load_balancer.id]
-  subnets            = aws_subnet.public[*].id
+  security_groups    = [aws_security_group.alsg.id]
+  subnets            = [aws_subnet.publicsubnet1.id, aws_subnet.publicsubnet2.id]
 }
 
-resource "aws_lb_target_group" "frontend" {
-  name        = "marketsquare-web"
+resource "aws_lb_target_group" "mytg" {
+  name_prefix = "msq-"
   port        = 80
   protocol    = "HTTP"
   target_type = "ip"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = aws_vpc.mymainvpc.id
 
   health_check {
     enabled             = true
@@ -108,27 +108,27 @@ resource "aws_lb_target_group" "frontend" {
 }
 
 resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.main.arn
+  load_balancer_arn = aws_lb.myalb.arn
   port              = 80
   protocol          = "HTTP"
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.frontend.arn
+    target_group_arn = aws_lb_target_group.mytg.arn
   }
 }
 
-resource "aws_ecs_cluster" "main" {
-  name = "${local.name}-cluster"
+resource "aws_ecs_cluster" "mktcluster" {
+  name = "marketsquare-cluster"
 }
 
-resource "aws_cloudwatch_log_group" "frontend" {
-  name              = "/ecs/${local.name}/frontend"
+resource "aws_cloudwatch_log_group" "mktloggroup" {
+  name              = "/ecs/marketsquare"
   retention_in_days = 14
 }
 
 resource "aws_iam_role" "task_execution" {
-  name = "${local.name}-task-execution"
+  name = "ecs-task-execution"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -147,8 +147,8 @@ resource "aws_iam_role_policy_attachment" "task_execution" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-resource "aws_ecs_task_definition" "frontend" {
-  family                   = "${local.name}-frontend"
+resource "aws_ecs_task_definition" "mytaskdef" {
+  family                   = "mytaskdef"
   cpu                      = var.container_cpu
   memory                   = var.container_memory
   network_mode             = "awsvpc"
@@ -156,7 +156,7 @@ resource "aws_ecs_task_definition" "frontend" {
   execution_role_arn       = aws_iam_role.task_execution.arn
 
   container_definitions = jsonencode([{
-    name      = "frontend"
+    name      = "marketsquare_app"
     image     = var.docker_image
     essential = true
     portMappings = [{
@@ -167,9 +167,9 @@ resource "aws_ecs_task_definition" "frontend" {
     logConfiguration = {
       logDriver = "awslogs"
       options = {
-        "awslogs-group"         = aws_cloudwatch_log_group.frontend.name
+        "awslogs-group"         = aws_cloudwatch_log_group.mktloggroup.name
         "awslogs-region"        = var.aws_region
-        "awslogs-stream-prefix" = "frontend"
+        "awslogs-stream-prefix" = "marketsquare"
       }
     }
     healthCheck = {
@@ -182,10 +182,10 @@ resource "aws_ecs_task_definition" "frontend" {
   }])
 }
 
-resource "aws_ecs_service" "frontend" {
-  name                               = "${local.name}-frontend"
-  cluster                            = aws_ecs_cluster.main.id
-  task_definition                    = aws_ecs_task_definition.frontend.arn
+resource "aws_ecs_service" "myservice" {
+  name                               = "service"
+  cluster                            = aws_ecs_cluster.mktcluster.id
+  task_definition                    = aws_ecs_task_definition.mytaskdef.arn
   desired_count                      = var.desired_count
   launch_type                        = "FARGATE"
   deployment_minimum_healthy_percent = 50
@@ -197,14 +197,14 @@ resource "aws_ecs_service" "frontend" {
   }
 
   network_configuration {
-    subnets          = aws_subnet.public[*].id
-    security_groups  = [aws_security_group.tasks.id]
+    subnets          = [aws_subnet.publicsubnet1.id, aws_subnet.publicsubnet2.id]
+    security_groups  = [aws_security_group.task-def.id]
     assign_public_ip = true
   }
 
   load_balancer {
-    target_group_arn = aws_lb_target_group.frontend.arn
-    container_name   = "frontend"
+    target_group_arn = aws_lb_target_group.mytg.arn
+    container_name   = "marketsquare_app"
     container_port   = 80
   }
 
